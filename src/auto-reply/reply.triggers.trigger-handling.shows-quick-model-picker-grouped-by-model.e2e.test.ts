@@ -59,9 +59,10 @@ describe("trigger handling", () => {
       const { normalized } = await runModelCommand(home, "/model");
 
       expect(normalized).toContain("Current: anthropic/claude-opus-4-5");
-      expect(normalized).toContain("/model <provider/model> to switch");
-      expect(normalized).toContain("Tap below to browse models");
-      expect(normalized).toContain("/model status for details");
+      expect(normalized).toContain("Switch: /model <provider/model>");
+      expect(normalized).toContain("Switch: /model-set <provider/model>");
+      expect(normalized).toContain("Browse: /models (providers) or /models <provider> (models)");
+      expect(normalized).toContain("More: /model status");
       expect(normalized).not.toContain("reasoning");
       expect(normalized).not.toContain("image");
     });

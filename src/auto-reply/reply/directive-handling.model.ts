@@ -1,3 +1,6 @@
+import type { OpenClawConfig } from "../../config/config.js";
+import type { ReplyPayload } from "../types.js";
+import type { InlineDirectives } from "./directive-handling.parse.js";
 import { resolveAuthStorePathForDisplay } from "../../agents/auth-profiles.js";
 import {
   type ModelAliasIndex,
@@ -6,10 +9,8 @@ import {
   resolveConfiguredModelRef,
   resolveModelRefFromString,
 } from "../../agents/model-selection.js";
-import type { OpenClawConfig } from "../../config/config.js";
 import { buildBrowseProvidersButton } from "../../telegram/model-buttons.js";
 import { shortenHomePath } from "../../utils.js";
-import type { ReplyPayload } from "../types.js";
 import { resolveModelsCommandReply } from "./commands-models.js";
 import {
   formatAuthLabel,
@@ -21,7 +22,6 @@ import {
   type ModelPickerCatalogEntry,
   resolveProviderEndpointLabel,
 } from "./directive-handling.model-picker.js";
-import type { InlineDirectives } from "./directive-handling.parse.js";
 import { type ModelDirectiveSelection, resolveModelDirectiveSelection } from "./model-selection.js";
 
 function pushUniqueCatalogEntry(params: {
@@ -49,7 +49,7 @@ function pushUniqueCatalogEntry(params: {
   });
 }
 
-function buildModelPickerCatalog(params: {
+export function buildModelPickerCatalog(params: {
   cfg: OpenClawConfig;
   defaultProvider: string;
   defaultModel: string;
@@ -243,6 +243,7 @@ export async function maybeHandleModelDirectiveInfo(params: {
           `Current: ${current}`,
           "",
           "Tap below to browse models, or use:",
+          "/model-set to search and switch",
           "/model <provider/model> to switch",
           "/model status for details",
         ].join("\n"),
@@ -255,6 +256,7 @@ export async function maybeHandleModelDirectiveInfo(params: {
         `Current: ${current}`,
         "",
         "Switch: /model <provider/model>",
+        "Switch: /model-set <provider/model>",
         "Browse: /models (providers) or /models <provider> (models)",
         "More: /model status",
       ].join("\n"),
@@ -360,8 +362,9 @@ export function resolveModelSelectionFromDirective(params: {
       errorText: [
         "Numeric model selection is not supported in chat.",
         "",
-        "Browse: /models or /models <provider>",
+        "Switch: /model-set <provider/model>",
         "Switch: /model <provider/model>",
+        "Browse: /models or /models <provider>",
       ].join("\n"),
     };
   }
