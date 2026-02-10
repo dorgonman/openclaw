@@ -88,13 +88,13 @@ export type HeartbeatSummary = {
 const DEFAULT_HEARTBEAT_TARGET = "last";
 const ACTIVE_HOURS_TIME_PATTERN = /^([01]\d|2[0-3]|24):([0-5]\d)$/;
 
-// Prompt used when an async exec has completed and the result should be relayed to the user.
+// Prompt used when an async exec has an update (completed/denied) that should be relayed.
 // This overrides the standard heartbeat prompt to ensure the model responds with the exec result
 // instead of just "HEARTBEAT_OK".
 const EXEC_EVENT_PROMPT =
-  "An async command you ran earlier has completed. The result is shown in the system messages above. " +
+  "An async command you ran earlier has an update (completed or denied). The result is shown in the system messages above. " +
   "Please relay the command output to the user in a helpful way. If the command succeeded, share the relevant output. " +
-  "If it failed, explain what went wrong.";
+  "If it failed or was denied, explain what went wrong and what the user can do next.";
 
 // Prompt used when a scheduled cron job has fired and injected a system event.
 // This overrides the standard heartbeat prompt so the model relays the scheduled
@@ -580,10 +580,12 @@ export async function runHeartbeatOnce(opts: {
   const isExecEvent = opts.reason === "exec-event";
   const isCronEvent = Boolean(opts.reason?.startsWith("cron:"));
   const pendingEvents = isExecEvent || isCronEvent ? peekSystemEvents(sessionKey) : [];
-  const hasExecCompletion = pendingEvents.some((evt) => evt.includes("Exec finished"));
+  const hasExecResult = pendingEvents.some(
+    (evt) => evt.includes("Exec finished") || evt.includes("Exec denied"),
+  );
   const hasCronEvents = isCronEvent && pendingEvents.length > 0;
 
-  const prompt = hasExecCompletion
+  const prompt = hasExecResult
     ? EXEC_EVENT_PROMPT
     : hasCronEvents
       ? CRON_EVENT_PROMPT
@@ -592,7 +594,7 @@ export async function runHeartbeatOnce(opts: {
     Body: prompt,
     From: sender,
     To: sender,
-    Provider: hasExecCompletion ? "exec-event" : hasCronEvents ? "cron-event" : "heartbeat",
+    Provider: hasExecResult ? "exec-event" : hasCronEvents ? "cron-event" : "heartbeat",
     SessionKey: sessionKey,
   };
   if (!visibility.showAlerts && !visibility.showOk && !visibility.useIndicator) {
@@ -668,19 +670,23 @@ export async function runHeartbeatOnce(opts: {
 
     const ackMaxChars = resolveHeartbeatAckMaxChars(cfg, heartbeat);
     const normalized = normalizeHeartbeatReply(replyPayload, responsePrefix, ackMaxChars);
-    // For exec completion events, don't skip even if the response looks like HEARTBEAT_OK.
+    // For exec result events, don't skip even if the response looks like HEARTBEAT_OK.
     // The model should be responding with exec results, not ack tokens.
-    // Also, if normalized.text is empty due to token stripping but we have exec completion,
-    // fall back to the original reply text.
+    // Also, if normalized.text is empty due to token stripping, fall back to
+    // the latest exec system event so users still get a visible status update.
+    const latestExecEvent =
+      hasExecResult && pendingEvents.length > 0
+        ? pendingEvents.toReversed().find((evt) => evt.startsWith("Exec "))
+        : null;
     const execFallbackText =
-      hasExecCompletion && !normalized.text.trim() && replyPayload.text?.trim()
-        ? replyPayload.text.trim()
+      hasExecResult && !normalized.text.trim()
+        ? (latestExecEvent ?? replyPayload.text?.trim() ?? null)
         : null;
     if (execFallbackText) {
       normalized.text = execFallbackText;
       normalized.shouldSkip = false;
     }
-    const shouldSkipMain = normalized.shouldSkip && !normalized.hasMedia && !hasExecCompletion;
+    const shouldSkipMain = normalized.shouldSkip && !normalized.hasMedia && !hasExecResult;
     if (shouldSkipMain && reasoningPayloads.length === 0) {
       await restoreHeartbeatUpdatedAt({
         storePath,

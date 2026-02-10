@@ -29,11 +29,13 @@ import {
   resolveHeartbeatDeliveryTarget,
   resolveHeartbeatSenderContext,
 } from "./outbound/targets.js";
+import { enqueueSystemEvent, resetSystemEventsForTest } from "./system-events.js";
 
 // Avoid pulling optional runtime deps during isolated runs.
 vi.mock("jiti", () => ({ createJiti: () => () => ({}) }));
 
 beforeEach(() => {
+  resetSystemEventsForTest();
   const runtime = createPluginRuntime();
   setTelegramRuntime(runtime);
   setWhatsAppRuntime(runtime);
@@ -801,6 +803,77 @@ describe("runHeartbeatOnce", () => {
         "Reasoning:\n_Because it helps_",
         expect.any(Object),
       );
+    } finally {
+      replySpy.mockRestore();
+      await fs.rm(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it("relays exec denied updates even when heartbeat reply is HEARTBEAT_OK", async () => {
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-hb-"));
+    const storePath = path.join(tmpDir, "sessions.json");
+    const replySpy = vi.spyOn(replyModule, "getReplyFromConfig");
+    try {
+      const cfg: OpenClawConfig = {
+        agents: {
+          defaults: {
+            workspace: tmpDir,
+            heartbeat: { every: "5m", target: "whatsapp" },
+          },
+        },
+        channels: { whatsapp: { allowFrom: ["*"] } },
+        session: { store: storePath },
+      };
+      const sessionKey = resolveMainSessionKey(cfg);
+
+      await fs.writeFile(
+        storePath,
+        JSON.stringify(
+          {
+            [sessionKey]: {
+              sessionId: "sid",
+              updatedAt: Date.now(),
+              lastChannel: "whatsapp",
+              lastProvider: "whatsapp",
+              lastTo: "+1555",
+            },
+          },
+          null,
+          2,
+        ),
+      );
+
+      const deniedEvent =
+        "Exec denied (gateway id=528b4a79-e6d9-4032-958e-b2ed80e1f25b, approval-timeout): opencode --version";
+      enqueueSystemEvent(deniedEvent, { sessionKey });
+
+      replySpy.mockResolvedValue({ text: "HEARTBEAT_OK" });
+      const sendWhatsApp = vi.fn().mockResolvedValue({
+        messageId: "m1",
+        toJid: "jid",
+      });
+
+      await runHeartbeatOnce({
+        cfg,
+        reason: "exec-event",
+        deps: {
+          sendWhatsApp,
+          getQueueSize: () => 0,
+          nowMs: () => 0,
+          webAuthExists: async () => true,
+          hasActiveWebListener: () => true,
+        },
+      });
+
+      expect(replySpy).toHaveBeenCalledWith(
+        expect.objectContaining({
+          Provider: "exec-event",
+        }),
+        expect.anything(),
+        cfg,
+      );
+      expect(sendWhatsApp).toHaveBeenCalledTimes(1);
+      expect(sendWhatsApp).toHaveBeenCalledWith("+1555", deniedEvent, expect.any(Object));
     } finally {
       replySpy.mockRestore();
       await fs.rm(tmpDir, { recursive: true, force: true });
