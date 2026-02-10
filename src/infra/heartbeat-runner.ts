@@ -94,14 +94,112 @@ export type HeartbeatSummary = {
 
 const DEFAULT_HEARTBEAT_TARGET = "last";
 
-// Prompt used when an async exec has completed and the result should be relayed to the user.
+// Prompt used when an async exec has an update (completed/denied) that should be relayed.
 // This overrides the standard heartbeat prompt to ensure the model responds with the exec result
 // instead of just "HEARTBEAT_OK".
 const EXEC_EVENT_PROMPT =
-  "An async command you ran earlier has completed. The result is shown in the system messages above. " +
+  "An async command you ran earlier has an update (completed or denied). The result is shown in the system messages above. " +
   "Please relay the command output to the user in a helpful way. If the command succeeded, share the relevant output. " +
-  "If it failed, explain what went wrong.";
-export { isCronSystemEvent };
+  "If it failed or was denied, explain what went wrong and what the user can do next.";
+
+// Prompt used when a scheduled cron job has fired and injected a system event.
+// This overrides the standard heartbeat prompt so the model relays the scheduled
+// reminder instead of responding with "HEARTBEAT_OK".
+const CRON_EVENT_PROMPT =
+  "A scheduled reminder has been triggered. The reminder message is shown in the system messages above. " +
+  "Please relay this reminder to the user in a helpful and friendly way.";
+
+function resolveActiveHoursTimezone(cfg: OpenClawConfig, raw?: string): string {
+  const trimmed = raw?.trim();
+  if (!trimmed || trimmed === "user") {
+    return resolveUserTimezone(cfg.agents?.defaults?.userTimezone);
+  }
+  if (trimmed === "local") {
+    const host = Intl.DateTimeFormat().resolvedOptions().timeZone;
+    return host?.trim() || "UTC";
+  }
+  try {
+    new Intl.DateTimeFormat("en-US", { timeZone: trimmed }).format(new Date());
+    return trimmed;
+  } catch {
+    return resolveUserTimezone(cfg.agents?.defaults?.userTimezone);
+  }
+}
+
+function parseActiveHoursTime(opts: { allow24: boolean }, raw?: string): number | null {
+  if (!raw || !ACTIVE_HOURS_TIME_PATTERN.test(raw)) {
+    return null;
+  }
+  const [hourStr, minuteStr] = raw.split(":");
+  const hour = Number(hourStr);
+  const minute = Number(minuteStr);
+  if (!Number.isFinite(hour) || !Number.isFinite(minute)) {
+    return null;
+  }
+  if (hour === 24) {
+    if (!opts.allow24 || minute !== 0) {
+      return null;
+    }
+    return 24 * 60;
+  }
+  return hour * 60 + minute;
+}
+
+function resolveMinutesInTimeZone(nowMs: number, timeZone: string): number | null {
+  try {
+    const parts = new Intl.DateTimeFormat("en-US", {
+      timeZone,
+      hour: "2-digit",
+      minute: "2-digit",
+      hourCycle: "h23",
+    }).formatToParts(new Date(nowMs));
+    const map: Record<string, string> = {};
+    for (const part of parts) {
+      if (part.type !== "literal") {
+        map[part.type] = part.value;
+      }
+    }
+    const hour = Number(map.hour);
+    const minute = Number(map.minute);
+    if (!Number.isFinite(hour) || !Number.isFinite(minute)) {
+      return null;
+    }
+    return hour * 60 + minute;
+  } catch {
+    return null;
+  }
+}
+
+function isWithinActiveHours(
+  cfg: OpenClawConfig,
+  heartbeat?: HeartbeatConfig,
+  nowMs?: number,
+): boolean {
+  const active = heartbeat?.activeHours;
+  if (!active) {
+    return true;
+  }
+
+  const startMin = parseActiveHoursTime({ allow24: false }, active.start);
+  const endMin = parseActiveHoursTime({ allow24: true }, active.end);
+  if (startMin === null || endMin === null) {
+    return true;
+  }
+  if (startMin === endMin) {
+    return true;
+  }
+
+  const timeZone = resolveActiveHoursTimezone(cfg, active.timezone);
+  const currentMin = resolveMinutesInTimeZone(nowMs ?? Date.now(), timeZone);
+  if (currentMin === null) {
+    return true;
+  }
+
+  if (endMin > startMin) {
+    return currentMin >= startMin && currentMin < endMin;
+  }
+  return currentMin >= startMin || currentMin < endMin;
+}
 
 type HeartbeatAgentState = {
   agentId: string;
@@ -467,24 +565,14 @@ export async function runHeartbeatOnce(opts: {
   // If so, use a specialized prompt that instructs the model to relay the result
   // instead of the standard heartbeat prompt with "reply HEARTBEAT_OK".
   const isExecEvent = opts.reason === "exec-event";
-  const pendingEventEntries = peekSystemEventEntries(sessionKey);
-  const hasTaggedCronEvents = pendingEventEntries.some((event) =>
-    event.contextKey?.startsWith("cron:"),
+  const isCronEvent = Boolean(opts.reason?.startsWith("cron:"));
+  const pendingEvents = isExecEvent || isCronEvent ? peekSystemEvents(sessionKey) : [];
+  const hasExecResult = pendingEvents.some(
+    (evt) => evt.includes("Exec finished") || evt.includes("Exec denied"),
   );
-  const shouldInspectPendingEvents = isExecEvent || isCronEventReason || hasTaggedCronEvents;
-  const pendingEvents = shouldInspectPendingEvents
-    ? pendingEventEntries.map((event) => event.text)
-    : [];
-  const cronEvents = pendingEventEntries
-    .filter(
-      (event) =>
-        (isCronEventReason || event.contextKey?.startsWith("cron:")) &&
-        isCronSystemEvent(event.text),
-    )
-    .map((event) => event.text);
-  const hasExecCompletion = pendingEvents.some(isExecCompletionEvent);
-  const hasCronEvents = cronEvents.length > 0;
-  const prompt = hasExecCompletion
+  const hasCronEvents = isCronEvent && pendingEvents.length > 0;
+
+  const prompt = hasExecResult
     ? EXEC_EVENT_PROMPT
     : hasCronEvents
       ? buildCronEventPrompt(cronEvents)
@@ -493,7 +581,7 @@ export async function runHeartbeatOnce(opts: {
     Body: appendCronStyleCurrentTimeLine(prompt, cfg, startedAt),
     From: sender,
     To: sender,
-    Provider: hasExecCompletion ? "exec-event" : hasCronEvents ? "cron-event" : "heartbeat",
+    Provider: hasExecResult ? "exec-event" : hasCronEvents ? "cron-event" : "heartbeat",
     SessionKey: sessionKey,
   };
   if (!visibility.showAlerts && !visibility.showOk && !visibility.useIndicator) {
@@ -574,19 +662,23 @@ export async function runHeartbeatOnce(opts: {
 
     const ackMaxChars = resolveHeartbeatAckMaxChars(cfg, heartbeat);
     const normalized = normalizeHeartbeatReply(replyPayload, responsePrefix, ackMaxChars);
-    // For exec completion events, don't skip even if the response looks like HEARTBEAT_OK.
+    // For exec result events, don't skip even if the response looks like HEARTBEAT_OK.
     // The model should be responding with exec results, not ack tokens.
-    // Also, if normalized.text is empty due to token stripping but we have exec completion,
-    // fall back to the original reply text.
+    // Also, if normalized.text is empty due to token stripping, fall back to
+    // the latest exec system event so users still get a visible status update.
+    const latestExecEvent =
+      hasExecResult && pendingEvents.length > 0
+        ? pendingEvents.toReversed().find((evt) => evt.startsWith("Exec "))
+        : null;
     const execFallbackText =
-      hasExecCompletion && !normalized.text.trim() && replyPayload.text?.trim()
-        ? replyPayload.text.trim()
+      hasExecResult && !normalized.text.trim()
+        ? (latestExecEvent ?? replyPayload.text?.trim() ?? null)
         : null;
     if (execFallbackText) {
       normalized.text = execFallbackText;
       normalized.shouldSkip = false;
     }
-    const shouldSkipMain = normalized.shouldSkip && !normalized.hasMedia && !hasExecCompletion;
+    const shouldSkipMain = normalized.shouldSkip && !normalized.hasMedia && !hasExecResult;
     if (shouldSkipMain && reasoningPayloads.length === 0) {
       await restoreHeartbeatUpdatedAt({
         storePath,
