@@ -103,6 +103,67 @@ const CRON_EVENT_PROMPT =
   "A scheduled reminder has been triggered. The reminder message is shown in the system messages above. " +
   "Please relay this reminder to the user in a helpful and friendly way.";
 
+type HeartbeatEventKind = "default" | "exec" | "cron";
+type HeartbeatEventRoutingMode = "direct" | "none" | "llm";
+
+const HEARTBEAT_DIRECTIVE_RE = /\[\[\s*([a-z][a-z0-9-]*)\s*:\s*([^\]]*?)\s*\]\]/gi;
+const SYSTEM_EVENT_MODEL_DIRECT = "direct";
+const SYSTEM_EVENT_MODEL_NONE = "none";
+
+function parseDirectivePairs(raw: string): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const segment of raw.split(",")) {
+    const [k, ...rest] = segment.split("=");
+    const key = (k ?? "").trim().toLowerCase();
+    const value = rest.join("=").trim();
+    if (!key || !value) {
+      continue;
+    }
+    out[key] = value;
+  }
+  return out;
+}
+
+function resolveHeartbeatPromptRuntime(rawPrompt: string): {
+  prompt: string;
+  modelByEvent: Partial<Record<HeartbeatEventKind, string>>;
+} {
+  const modelByEvent: Partial<Record<HeartbeatEventKind, string>> = {};
+
+  const cleaned = rawPrompt
+    .replace(HEARTBEAT_DIRECTIVE_RE, (token, keyRaw: string, valueRaw: string) => {
+      const key = keyRaw.toLowerCase();
+      const value = valueRaw.trim();
+
+      if (key === "event-model") {
+        const scalar = value.trim();
+        if (scalar && !scalar.includes("=")) {
+          modelByEvent.default = scalar;
+          return "";
+        }
+        const pairs = parseDirectivePairs(value);
+        for (const [eventKey, modelRaw] of Object.entries(pairs)) {
+          const model = modelRaw.trim();
+          if (!model) {
+            continue;
+          }
+          if (eventKey === "default" || eventKey === "exec" || eventKey === "cron") {
+            modelByEvent[eventKey] = model;
+          }
+        }
+        return "";
+      }
+
+      return token;
+    })
+    .trim();
+
+  return {
+    prompt: resolveHeartbeatPromptText(cleaned),
+    modelByEvent,
+  };
+}
+
 function resolveActiveHoursTimezone(cfg: OpenClawConfig, raw?: string): string {
   const trimmed = raw?.trim();
   if (!trimmed || trimmed === "user") {
@@ -336,6 +397,54 @@ export function resolveHeartbeatPrompt(cfg: OpenClawConfig, heartbeat?: Heartbea
   return resolveHeartbeatPromptText(heartbeat?.prompt ?? cfg.agents?.defaults?.heartbeat?.prompt);
 }
 
+function resolveEventModelOverride(params: {
+  runtime: ReturnType<typeof resolveHeartbeatPromptRuntime>;
+  event: HeartbeatEventKind;
+}): string | undefined {
+  return params.runtime.modelByEvent[params.event] ?? params.runtime.modelByEvent.default;
+}
+
+function resolveEventRouting(params: {
+  runtime: ReturnType<typeof resolveHeartbeatPromptRuntime>;
+  event: HeartbeatEventKind;
+}): { mode: HeartbeatEventRoutingMode; modelOverride?: string } {
+  const configuredRaw = resolveEventModelOverride(params)?.trim();
+  const configured = configuredRaw?.toLowerCase();
+  if (configured === SYSTEM_EVENT_MODEL_DIRECT) {
+    return { mode: "direct" };
+  }
+  if (configured === SYSTEM_EVENT_MODEL_NONE) {
+    return { mode: "none" };
+  }
+  if (configuredRaw) {
+    return { mode: "llm", modelOverride: configuredRaw };
+  }
+  if (params.event === "exec") {
+    return { mode: "direct" };
+  }
+  return { mode: "llm" };
+}
+
+function applyHeartbeatModelOverride(cfg: OpenClawConfig, model?: string): OpenClawConfig {
+  const trimmed = model?.trim();
+  if (!trimmed) {
+    return cfg;
+  }
+  return {
+    ...cfg,
+    agents: {
+      ...cfg.agents,
+      defaults: {
+        ...cfg.agents?.defaults,
+        heartbeat: {
+          ...cfg.agents?.defaults?.heartbeat,
+          model: trimmed,
+        },
+      },
+    },
+  };
+}
+
 function resolveHeartbeatAckMaxChars(cfg: OpenClawConfig, heartbeat?: HeartbeatConfig) {
   return Math.max(
     0,
@@ -497,23 +606,25 @@ export async function runHeartbeatOnce(opts: {
   const cfg = opts.cfg ?? loadConfig();
   const agentId = normalizeAgentId(opts.agentId ?? resolveDefaultAgentId(cfg));
   const heartbeat = opts.heartbeat ?? resolveHeartbeatConfig(cfg, agentId);
-  if (!heartbeatsEnabled) {
+  const isExecEventReason = opts.reason === "exec-event";
+  const isCronEventReason = Boolean(opts.reason?.startsWith("cron:"));
+  if (!heartbeatsEnabled && !isExecEventReason) {
     return { status: "skipped", reason: "disabled" };
   }
-  if (!isHeartbeatEnabledForAgent(cfg, agentId)) {
+  if (!isHeartbeatEnabledForAgent(cfg, agentId) && !isExecEventReason) {
     return { status: "skipped", reason: "disabled" };
   }
-  if (!resolveHeartbeatIntervalMs(cfg, undefined, heartbeat)) {
+  if (!resolveHeartbeatIntervalMs(cfg, undefined, heartbeat) && !isExecEventReason) {
     return { status: "skipped", reason: "disabled" };
   }
 
   const startedAt = opts.deps?.nowMs?.() ?? Date.now();
-  if (!isWithinActiveHours(cfg, heartbeat, startedAt)) {
+  if (!isWithinActiveHours(cfg, heartbeat, startedAt) && !isExecEventReason) {
     return { status: "skipped", reason: "quiet-hours" };
   }
 
   const queueSize = (opts.deps?.getQueueSize ?? getQueueSize)(CommandLane.Main);
-  if (queueSize > 0) {
+  if (queueSize > 0 && !isExecEventReason) {
     return { status: "skipped", reason: "requests-in-flight" };
   }
 
@@ -521,8 +632,6 @@ export async function runHeartbeatOnce(opts: {
   // This saves API calls/costs when the file is effectively empty (only comments/headers).
   // EXCEPTION: Don't skip for exec events or cron events - they have pending system events
   // to process regardless of HEARTBEAT.md content.
-  const isExecEventReason = opts.reason === "exec-event";
-  const isCronEventReason = Boolean(opts.reason?.startsWith("cron:"));
   const workspaceDir = resolveAgentWorkspaceDir(cfg, agentId);
   const heartbeatFilePath = path.join(workspaceDir, DEFAULT_HEARTBEAT_FILENAME);
   try {
@@ -573,6 +682,9 @@ export async function runHeartbeatOnce(opts: {
     channel: delivery.channel !== "none" ? delivery.channel : undefined,
     accountId: delivery.accountId,
   }).responsePrefix;
+  const heartbeatPromptRuntime = resolveHeartbeatPromptRuntime(
+    resolveHeartbeatPrompt(cfg, heartbeat),
+  );
 
   // Check if this is an exec event or cron event with pending system events.
   // If so, use a specialized prompt that instructs the model to relay the result
@@ -584,12 +696,89 @@ export async function runHeartbeatOnce(opts: {
     (evt) => evt.includes("Exec finished") || evt.includes("Exec denied"),
   );
   const hasCronEvents = isCronEvent && pendingEvents.length > 0;
+  const eventKind: HeartbeatEventKind = hasExecResult ? "exec" : hasCronEvents ? "cron" : "default";
+  const eventRouting = resolveEventRouting({ runtime: heartbeatPromptRuntime, event: eventKind });
+  const shouldUseStaticEventReport = eventKind !== "default" && eventRouting.mode === "direct";
+
+  const deliverDirectEventReport = async (): Promise<boolean> => {
+    const latestExecEvent = pendingEvents.toReversed().find((evt) => evt.startsWith("Exec "));
+    const latestCronEvent = pendingEvents.toReversed()[0];
+    const directTextBase = eventKind === "exec" ? latestExecEvent?.trim() : latestCronEvent?.trim();
+    const directText =
+      directTextBase && responsePrefix && !directTextBase.startsWith(responsePrefix)
+        ? `${responsePrefix} ${directTextBase}`
+        : directTextBase;
+
+    if (!directText) {
+      return false;
+    }
+    if (delivery.channel === "none" || !delivery.to) {
+      emitHeartbeatEvent({
+        status: "skipped",
+        reason: delivery.reason ?? "no-target",
+        preview: directText.slice(0, 200),
+        durationMs: Date.now() - startedAt,
+        accountId: delivery.accountId,
+      });
+      return true;
+    }
+
+    if (!visibility.showAlerts) {
+      emitHeartbeatEvent({
+        status: "skipped",
+        reason: "alerts-disabled",
+        preview: directText.slice(0, 200),
+        durationMs: Date.now() - startedAt,
+        channel: delivery.channel,
+        accountId: delivery.accountId,
+      });
+      return true;
+    }
+
+    await deliverOutboundPayloads({
+      cfg,
+      channel: delivery.channel,
+      to: delivery.to,
+      accountId: delivery.accountId,
+      payloads: [{ text: directText }],
+      deps: opts.deps,
+    });
+
+    emitHeartbeatEvent({
+      status: "sent",
+      to: delivery.to,
+      preview: directText.slice(0, 200),
+      durationMs: Date.now() - startedAt,
+      channel: delivery.channel,
+      accountId: delivery.accountId,
+      indicatorType: visibility.useIndicator ? resolveIndicatorType("sent") : undefined,
+    });
+    return true;
+  };
+
+  if (shouldUseStaticEventReport) {
+    if (await deliverDirectEventReport()) {
+      return { status: "ran", durationMs: Date.now() - startedAt };
+    }
+  }
+
+  if (eventRouting.mode === "none") {
+    emitHeartbeatEvent({
+      status: "skipped",
+      reason: `${eventKind}-events-muted`,
+      durationMs: Date.now() - startedAt,
+      channel: delivery.channel !== "none" ? delivery.channel : undefined,
+      accountId: delivery.accountId,
+    });
+    return { status: "ran", durationMs: Date.now() - startedAt };
+  }
 
   const prompt = hasExecResult
     ? EXEC_EVENT_PROMPT
     : hasCronEvents
       ? CRON_EVENT_PROMPT
-      : resolveHeartbeatPrompt(cfg, heartbeat);
+      : heartbeatPromptRuntime.prompt;
+  const replyCfg = applyHeartbeatModelOverride(cfg, eventRouting.modelOverride);
   const ctx = {
     Body: prompt,
     From: sender,
@@ -639,7 +828,7 @@ export async function runHeartbeatOnce(opts: {
   };
 
   try {
-    const replyResult = await getReplyFromConfig(ctx, { isHeartbeat: true }, cfg);
+    const replyResult = await getReplyFromConfig(ctx, { isHeartbeat: true }, replyCfg);
     const replyPayload = resolveHeartbeatReplyPayload(replyResult);
     const includeReasoning = heartbeat?.includeReasoning === true;
     const reasoningPayloads = includeReasoning
