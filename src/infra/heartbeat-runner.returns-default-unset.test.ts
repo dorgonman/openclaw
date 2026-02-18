@@ -105,15 +105,18 @@ beforeAll(async () => {
 beforeEach(() => {
   setHeartbeatsEnabled(true);
   resetSystemEventsForTest();
-  const runtime = createPluginRuntime();
-  setTelegramRuntime(runtime);
-  setWhatsAppRuntime(runtime);
-  setActivePluginRegistry(
-    createTestRegistry([
-      { pluginId: "whatsapp", plugin: whatsappPlugin, source: "test" },
-      { pluginId: "telegram", plugin: telegramPlugin, source: "test" },
-    ]),
-  );
+  if (testRegistry) {
+    setActivePluginRegistry(testRegistry);
+  }
+});
+
+afterAll(async () => {
+  if (fixtureRoot) {
+    await fs.rm(fixtureRoot, { recursive: true, force: true });
+  }
+  if (previousRegistry) {
+    setActivePluginRegistry(previousRegistry);
+  }
 });
 
 describe("resolveHeartbeatIntervalMs", () => {
@@ -1201,7 +1204,7 @@ describe("runHeartbeatOnce", () => {
         },
       });
 
-      const usedCfg = replySpy.mock.calls[0]?.[2] as OpenClawConfig | undefined;
+      const usedCfg = replySpy.mock.calls[0]?.[2];
       expect(usedCfg?.agents?.defaults?.heartbeat?.model).toBe("openai/gpt-4o-mini");
       expect(sendWhatsApp).toHaveBeenCalledWith("+1555", "LLM summarized.", expect.any(Object));
     } finally {
