@@ -490,6 +490,7 @@ export async function runHeartbeatOnce(opts: {
   const heartbeat = opts.heartbeat ?? resolveHeartbeatConfig(cfg, agentId);
   const isExecEventReason = opts.reason === "exec-event";
   const isCronEventReason = Boolean(opts.reason?.startsWith("cron:"));
+  const isWakeReason = opts.reason === "wake" || opts.reason === "hook:wake";
   if (!heartbeatsEnabled && !isExecEventReason) {
     return { status: "skipped", reason: "disabled" };
   }
